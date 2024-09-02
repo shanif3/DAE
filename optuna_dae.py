@@ -14,7 +14,7 @@ from pytorch_lightning.loggers import WandbLogger
 from main import DAELightning, prepare_data
 
 
-def objective(trial, X_train, y_train, X_val, y_val, column_types):
+def objective(trial, X_train, y_train, X_val, y_val, column_types,categorical_dims):
     # Hyperparameters to optimize
     latent_dim = trial.suggest_int('latent_dim', 10, 200)
     n_hidden_layers = trial.suggest_int('n_hidden_layers', 1, 3)
@@ -58,6 +58,7 @@ def objective(trial, X_train, y_train, X_val, y_val, column_types):
         hidden_dims=hidden_dims,
         dropout_rate=dropout_rate,
         column_types=column_types,
+        categorical_dims= categorical_dims,
         learning_rate=learning_rate
     )
 
@@ -95,9 +96,10 @@ def optimize_model_for_dataset(dataset_path: str, target_column: str):
     X_train, y_train = data['X_train'], data['y_train']
     X_val, y_val = data['X_val'], data['y_val']
     column_types = data['column_types']
+    categorical_dims= data['categorical_dims']
 
     # Create a partial function with data pre-filled
-    objective_with_data = lambda trial: objective(trial, X_train, y_train, X_val, y_val, column_types)
+    objective_with_data = lambda trial: objective(trial, X_train, y_train, X_val, y_val, column_types,categorical_dims)
 
     # Run the optimization
     study = optuna.create_study(direction='minimize')
