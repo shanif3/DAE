@@ -17,6 +17,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
 import os
+from pytorch_lightning.loggers import WandbLogger
 class DAENetwork(nn.Module):
     def __init__(self, input_size: int, latent_dim: int, hidden_dims: List[int],
                  dropout_rate: float, column_types: List[str], categorical_dims: Dict[str, int]):
@@ -129,9 +130,9 @@ class DAELightning(pl.LightningModule):
 
         if len(set(y_true)) > 1:  # Check if there is more than one class present
             auc = roc_auc_score(y_true, y_pred)
-            self.log(f"{stage}_auc", auc, prog_bar=True)
+            self.log(f"{stage}_auc", auc, prog_bar=True, on_step=False, on_epoch=True)
 
-        self.log(f"{stage}_loss", loss, prog_bar=True)
+        self.log(f"{stage}_loss", loss, prog_bar=True, on_step=False, on_epoch=True)
 
         return loss
 
@@ -305,9 +306,10 @@ def main():
     val_dataset = TensorDataset(torch.FloatTensor(data['X_val'].values), torch.FloatTensor(data['y_val'].values))
     test_dataset = TensorDataset(torch.FloatTensor(data['X_test'].values), torch.FloatTensor(data['y_test'].values))
 
-    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=32)
-    test_loader = DataLoader(test_dataset, batch_size=32)
+    BATCH_SIZE= 32
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE)
+    test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE)
 
     # Model hyperparameters
     input_size = data['input_size']
@@ -329,7 +331,11 @@ def main():
     )
     # Initialize TensorBoard logger
     logger = TensorBoardLogger("calude/tb_logs", name="DAE_model")
+    # initialise the wandb logger and name your wandb project
+    wandb_logger = WandbLogger(project='DAE-heart_statlog')
 
+    # add your batch size to the wandb config
+    wandb_logger.experiment.config["batch_size"] = BATCH_SIZE
     # Callbacks
     early_stop_callback = EarlyStopping(
         monitor='val_loss',
@@ -349,7 +355,7 @@ def main():
     # Trainer
     trainer = pl.Trainer(
         max_epochs=1000,
-        logger=logger,
+        logger=[logger,wandb_logger],
         callbacks=[early_stop_callback, checkpoint_callback],
         devices=1,
         enable_progress_bar=True,
