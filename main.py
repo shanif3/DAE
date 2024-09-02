@@ -3,6 +3,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from pytorch_lightning.loggers import TensorBoardLogger
+from lightning.pytorch.loggers import WandbLogger
+
 from sklearn.compose import ColumnTransformer
 from torch.utils.data import DataLoader, TensorDataset
 import pytorch_lightning as pl
@@ -17,11 +19,13 @@ from tensorboard.backend.event_processing.event_accumulator import EventAccumula
 import os
 class DAENetwork(nn.Module):
     def __init__(self, input_size: int, latent_dim: int, hidden_dims: List[int],
-                 dropout_rate: float, column_types: List[str]):
+                 dropout_rate: float, column_types: List[str], categorical_dims: Dict[str, int]):
         super(DAENetwork, self).__init__()
         self.input_size = input_size
         self.latent_dim = latent_dim
         self.column_types = column_types
+        self.categorical_dims = categorical_dims
+
 
         # Encoder
         encoder_layers = []
@@ -49,19 +53,6 @@ class DAENetwork(nn.Module):
             current_dim = hidden_dim
         self.decoder = nn.Sequential(*decoder_layers, nn.Linear(current_dim, input_size))
 
-        # Column-specific activations
-        self.column_activations = nn.ModuleList()
-        for col_type in self.column_types.values():
-            if col_type == 'categorical':
-                self.column_activations.append(nn.Softmax(dim=1))
-            elif col_type == 'boolean':
-                self.column_activations.append(nn.Sigmoid())
-            elif col_type == 'real_positive':
-                self.column_activations.append(nn.LeakyReLU())
-            # getting identity() for col_type == 'real' and else
-            else:
-                self.column_activations.append(nn.Identity())
-
         # Classifier
         self.classifier = nn.Sequential(
             nn.Linear(latent_dim, 100),
@@ -78,9 +69,28 @@ class DAENetwork(nn.Module):
 
     def decode(self, z):
         reconstructed = self.decoder(z)
-        split_reconstructed_to_columns = torch.split(reconstructed, [1] * reconstructed.size(1), dim=1)
-        activated_outputs = [activation(col) for activation, col in
-                             zip(self.column_activations, split_reconstructed_to_columns)]
+
+        # Split the reconstructed output into groups based on column types
+        start = 0
+        activated_outputs = []
+
+        for col, col_type in self.column_types.items():
+            if col_type == 'categorical':
+                end = start + self.categorical_dims[col]
+                cat_output = reconstructed[:, start:end]
+                if cat_output.shape[1] != 0: # meaning that this column is starting the one hot category
+                    activated_outputs.append(F.softmax(cat_output, dim=1))
+                    start = end
+            elif col_type == 'boolean':
+                activated_outputs.append(torch.sigmoid(reconstructed[:, start:start + 1]))
+                start += 1
+            elif col_type == 'real_positive':
+                activated_outputs.append(F.leaky_relu(reconstructed[:, start:start + 1]))
+                start += 1
+            else:  # getting identity() for col_type == 'real' and else
+                activated_outputs.append(reconstructed[:, start:start + 1])
+                start += 1
+
         return torch.cat(activated_outputs, dim=1)
 
     def forward(self, x, mask):
@@ -89,13 +99,12 @@ class DAENetwork(nn.Module):
         classification = self.classifier(latent)
         return reconstructed, classification
 
-
 class DAELightning(pl.LightningModule):
     def __init__(self, input_size: int, latent_dim: int, hidden_dims: List[int],
-                 dropout_rate: float, column_types: List[str], learning_rate: float):
+                 dropout_rate: float, column_types: List[str],  categorical_dims: Dict[str,int], learning_rate: float):
         super(DAELightning, self).__init__()
         self.save_hyperparameters()
-        self.model = DAENetwork(input_size, latent_dim, hidden_dims, dropout_rate, column_types)
+        self.model = DAENetwork(input_size, latent_dim, hidden_dims, dropout_rate, column_types, categorical_dims)
         self.learning_rate = learning_rate
 
     def training_step(self, batch, batch_idx):
@@ -202,6 +211,7 @@ def save_tensorboard_plots(log_dir: str, output_dir: str):
     plt.title('Training and Validation AUC Over Time')
     plt.legend()
     plt.savefig(os.path.join(output_dir, 'auc.png'))
+
 def prepare_data(file_path: str, target_column: str) -> Dict:
     df = pd.read_csv(file_path)
     # column_types = {
@@ -263,11 +273,24 @@ def prepare_data(file_path: str, target_column: str) -> Dict:
             column_types[col] = 'real'
         elif any(orig_col in col for orig_col in categorical_columns):
             column_types[col] = 'categorical'
+
+    # Calculate categorical_dims
+    categorical_dims = {}
+    onehot_encoder = scaler_pipeline.named_transformers_['onehot']
+    for orig_col, encoded_cols in zip(categorical_columns, onehot_encoder.categories_):
+        n_categories = len(encoded_cols)
+        if n_categories>=2:
+            for i in range(n_categories):
+                item_value = encoded_cols[i]
+                col_name = f"onehot__{orig_col}_{item_value}"
+                categorical_dims[col_name]= n_categories if i==0 else 0 # putting 0 if the one hot column is not the column that start the one hot, if it is I will put the number of columns that encoded in the same category.
+
     return {
         'X_train': X_train, 'y_train': y_train,
         'X_val': X_val, 'y_val': y_val,
         'X_test': X_test, 'y_test': y_test,
         'column_types': column_types,
+        'categorical_dims': categorical_dims,
         'input_size': X_train.shape[1]
     }
 
@@ -301,6 +324,7 @@ def main():
         hidden_dims=hidden_dims,
         dropout_rate=dropout_rate,
         column_types=data['column_types'],
+        categorical_dims=data['categorical_dims'],
         learning_rate=learning_rate
     )
     # Initialize TensorBoard logger
