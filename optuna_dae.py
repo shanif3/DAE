@@ -1,7 +1,6 @@
 import os
 import json
 import pandas as pd
-import optuna
 import torch
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import EarlyStopping
