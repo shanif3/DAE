@@ -64,6 +64,7 @@ class DAENetwork(nn.Module):
         )
 
     def encode(self, x, mask):
+        x= x*mask
         concat = torch.cat([x, mask], 1)
         latent = self.encoder(concat)
         return latent
@@ -107,6 +108,8 @@ class DAELightning(pl.LightningModule):
         self.save_hyperparameters()
         self.model = DAENetwork(input_size, latent_dim, hidden_dims, dropout_rate, column_types, categorical_dims)
         self.learning_rate = learning_rate
+        self.column_types= column_types
+        self.categorical_dims = categorical_dims
 
     def training_step(self, batch, batch_idx):
         return self._common_step(batch, batch_idx, "train")
@@ -137,7 +140,26 @@ class DAELightning(pl.LightningModule):
         return loss
 
     def loss_function(self, reconstructed, x, classification, y):
-        reconstruction_loss = F.mse_loss(reconstructed, x)
+        start=0
+        activated_outputs=[]
+        for col, col_type in self.column_types.items():
+            if col_type == 'categorical':
+                end = start + self.categorical_dims[col]
+                cat_output = reconstructed[:, start:end]
+
+                if cat_output.shape[1] != 0:  # meaning that this column is starting the one hot category
+                    activated_outputs.append(nn.CrossEntropyLoss()(cat_output, x[:,start:end]))
+                    start = end
+            elif col_type == 'boolean':
+                activated_outputs.append(F.binary_cross_entropy(reconstructed[:, start:start + 1],x[:,start:start + 1]))
+                start += 1
+            else:
+                activated_outputs.append(F.mse_loss(reconstructed[:, start:start + 1], x[:,start:start + 1]))
+                start+=1
+
+
+        reconstruction_loss= torch.sum(torch.stack(activated_outputs))
+        # reconstruction_loss = F.mse_loss(reconstructed, x)
         classification_loss = F.binary_cross_entropy(classification, y.float().unsqueeze(1))
         return reconstruction_loss + classification_loss
 
