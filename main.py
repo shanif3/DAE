@@ -4,6 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from pytorch_lightning.loggers import TensorBoardLogger
 from lightning.pytorch.loggers import WandbLogger
+from torchmetrics.classification import BinaryAUROC
 
 from sklearn.compose import ColumnTransformer
 from torch.utils.data import DataLoader, TensorDataset
@@ -111,18 +112,30 @@ class DAELightning(pl.LightningModule):
         self.column_types= column_types
         self.categorical_dims = categorical_dims
 
+        self.train_auroc = BinaryAUROC()
+        self.val_auroc = BinaryAUROC()
+        self.test_auroc = BinaryAUROC()
+
     def training_step(self, batch, batch_idx):
-        return self._common_step(batch, batch_idx, "train")
+        loss,y_true,y_pred= self._common_step(batch, batch_idx, "train")
+
+        self.train_auroc.update(y_pred, y_true)
+        return loss
 
     def validation_step(self, batch, batch_idx):
-        self._common_step(batch, batch_idx, "val")
+        loss,y_true,y_pred=self._common_step(batch, batch_idx, "val")
+        self.val_auroc.update(y_pred, y_true)
 
     def test_step(self, batch, batch_idx):
-        self._common_step(batch, batch_idx, "test")
+        loss,y_true,y_pred= self._common_step(batch, batch_idx, "test")
+        self.test_auroc.update(y_pred, y_true)
 
     def _common_step(self, batch, batch_idx, stage):
         x, y = batch
         mask = self.generate_mask(x.shape)
+        nan_mask= self.create_nan_mask(x)
+        mask= self.combine_mask(nan_mask,mask)
+        x= torch.nan_to_num(x,nan=0.0)
         reconstructed, classification = self.model(x, mask)
 
         loss = self.loss_function(reconstructed, x, classification, y)
@@ -131,14 +144,26 @@ class DAELightning(pl.LightningModule):
         y_pred = classification.squeeze().cpu().detach().numpy()
         y_true = y.cpu().numpy()
 
-        if len(set(y_true)) > 1:  # Check if there is more than one class present
-            auc = roc_auc_score(y_true, y_pred)
-            self.log(f"{stage}_auc", auc, prog_bar=True, on_step=False, on_epoch=True)
+
 
         self.log(f"{stage}_loss", loss, prog_bar=True, on_step=False, on_epoch=True)
 
-        return loss
+        return loss, y,classification.squeeze()
 
+    def on_train_epoch_end(self):
+        train_auc = self.train_auroc.compute()
+        self.log("train_auc", train_auc, on_step=False, on_epoch=True)
+        self.train_auroc.reset()
+
+    def on_validation_epoch_end(self):
+        val_auc = self.val_auroc.compute()
+        self.log("val_auc", val_auc, on_step=False, on_epoch=True)
+        self.val_auroc.reset()
+
+    def on_test_epoch_end(self):
+        test_auc = self.test_auroc.compute()
+        self.log("test_auc", test_auc, on_step=False, on_epoch=True)
+        self.test_auroc.reset()
     def loss_function(self, reconstructed, x, classification, y):
         start=0
         activated_outputs=[]
@@ -164,10 +189,24 @@ class DAELightning(pl.LightningModule):
         return reconstruction_loss + classification_loss
 
     def generate_mask(self, shape):
-        p = np.random.uniform(0.1, 0.9)
-        p = torch.full((shape[1],), p)
-        mask = torch.bernoulli(p).expand(shape[0], -1).to(self.device)
+        all_rows=[]
+        for i in range(shape[0]):
+            p= np.random.uniform(0.5,0.9)
+            p=torch.full((shape[1],),p)
+            mask=torch.bernoulli(p)
+            all_rows.append(mask)
+        mask= torch.stack(all_rows).to(self.device)
+        # p = np.random.uniform(0.1, 0.9)
+        # p = torch.full((shape[1],), p)
+        # mask = torch.bernoulli(p).expand(shape[0], -1).to(self.device)
         return mask
+    def create_nan_mask(self, x):
+        mask= ~torch.isnan(x)
+        mask= mask.int()
+        return mask
+    def combine_mask(self, nan_mask, mask):
+        combined_mask=torch.where(nan_mask==1,mask,nan_mask)
+        return combined_mask
 
     def configure_optimizers(self):
         optimizer = torch.optim.Adam(self.parameters(), lr=self.learning_rate)
@@ -252,7 +291,7 @@ def prepare_data(file_path: str, target_column: str) -> Dict:
                                                       stratify=y_train)  # 0.25 x 0.8 = 0.2
 
     # Checking columns types based on train and valid data so we can catch most of the values
-    bool_columns = [col for col in X_TRAIN.columns if X_TRAIN[col].nunique() == 2]
+    bool_columns = [col for col in X_TRAIN.columns if X_TRAIN[col].nunique() == 2 and set(X_TRAIN[col].unique()) == {0, 1}]
     real_positive_columns = [col for col in X_TRAIN.columns if X_TRAIN[col].nunique() > 20 and (X_TRAIN[col] > 0).all()]
     real_columns = [col for col in X_TRAIN.columns if X_TRAIN[col].nunique() > 20 and not (X_TRAIN[col] > 0).all()]
     non_categorical_columns = bool_columns + real_columns + real_positive_columns
@@ -277,9 +316,9 @@ def prepare_data(file_path: str, target_column: str) -> Dict:
     feature_names = scaler_pipeline.get_feature_names_out()
 
     # Create DataFrames with the correct column names
-    X_train = pd.DataFrame(X_train_transformed, columns=feature_names)
-    X_val = pd.DataFrame(X_val_transformed, columns=feature_names)
-    X_test = pd.DataFrame(X_test_transformed, columns=feature_names)
+    X_train = pd.DataFrame(X_train_transformed.toarray(), columns=feature_names)
+    X_val = pd.DataFrame(X_val_transformed.toarray(), columns=feature_names)
+    X_test = pd.DataFrame(X_test_transformed.toarray(), columns=feature_names)
 
     # Ensure that all sets have the same columns after one-hot encoding
     X_train, X_val = X_train.align(X_val, join='left', axis=1, fill_value=0)
@@ -320,8 +359,14 @@ def prepare_data(file_path: str, target_column: str) -> Dict:
 
 def main():
     # Prepare data
-    data = prepare_data(r"Data/heart_statlog_cleveland_hungary_final.csv",
+    # data = prepare_data(r"Data/heart_statlog_cleveland_hungary_final.csv",
+    #                     target_column='target')
+
+    data = prepare_data(r"see.csv",
                         target_column='target')
+
+
+
     num_workers = 4
     # Create DataLoaders
     train_dataset = TensorDataset(torch.FloatTensor(data['X_train'].values), torch.FloatTensor(data['y_train'].values))
@@ -361,10 +406,10 @@ def main():
     # Callbacks
     early_stop_callback = EarlyStopping(
         monitor='val_loss',
-        min_delta=0.00,
-        patience=10,
-        verbose=False,
-        mode='min'
+        min_delta=0.000002,
+        patience=20,
+        verbose=True,
+        mode='max'
     )
     checkpoint_callback = ModelCheckpoint(
         monitor='val_loss',
@@ -376,9 +421,10 @@ def main():
 
     # Trainer
     trainer = pl.Trainer(
-        max_epochs=1000,
+        max_epochs=200,
         logger=[logger,wandb_logger],
         callbacks=[early_stop_callback, checkpoint_callback],
+        # callbacks=[ checkpoint_callback],
         devices=1,
         enable_progress_bar=True,
     )
@@ -396,8 +442,11 @@ def main():
 
     with torch.no_grad():
         x_test = torch.FloatTensor(data['X_test'].values).to(best_model.device)
-        mask = torch.ones_like(x_test)
-        reconstructed, predictions = best_model.model(x_test, mask)
+        x_test= torch.nan_to_num(x_test,nan=0.0)
+        nan_mask= best_model.create_nan_mask(x_test)
+        # mask = best_model.generate_mask(x_test.shape)
+        # mask= best_model.combine_mask(nan_mask,mask)
+        reconstructed, predictions = best_model.model(x_test, nan_mask)
         predictions = (predictions > 0.5).squeeze().cpu().numpy()
 
     print(f"Accuracy: {accuracy_score(data['y_test'], predictions):.4f}")
@@ -407,7 +456,10 @@ def main():
     if len(set(data['y_test'])) > 1:  # Ensure both classes are present to calculate AUC
         auc_score = roc_auc_score(data['y_test'], predictions)
         print(f"AUC: {auc_score:.4f}")
-
+    reconstructed=reconstructed.cpu().numpy()
+    reconstructed= pd.DataFrame(reconstructed, columns=data['X_test'].columns)
+    reconstructed.to_csv('reconstructed.csv')
+    data['y_test'].to_csv('y_test.csv')
     # Save plots after training
     save_tensorboard_plots(log_dir=logger.log_dir, output_dir='calude/plots')
 

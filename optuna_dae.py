@@ -76,7 +76,7 @@ def objective(trial, X_train, y_train, X_val, y_val, column_types,categorical_di
 
     # Trainer
     trainer = pl.Trainer(
-        max_epochs=100,
+        max_epochs=300,
         logger=[wandb_logger, logger],  # Use both loggers
         callbacks=[early_stop_callback],
         enable_progress_bar=True
@@ -103,7 +103,7 @@ def optimize_model_for_dataset(dataset_path: str, target_column: str):
 
     # Run the optimization
     study = optuna.create_study(direction='minimize')
-    study.optimize(objective_with_data, n_trials=3)  # Adjust number of trials as needed
+    study.optimize(objective_with_data, n_trials=10)  # Adjust number of trials as needed
 
     best_params = study.best_params
 
